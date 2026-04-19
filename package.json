@@ -1,0 +1,8 @@
+{
+  "name": "reasoning-proxy",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "bun run --watch server.ts",
+    "start": "bun run server.ts"
+  }
+}
