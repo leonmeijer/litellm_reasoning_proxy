@@ -101,10 +101,24 @@ ANTHROPIC_BASE_URL=http://localhost:8081 claude
 export ANTHROPIC_BASE_URL=http://localhost:8081
 ```
 
+### Pre-built image (GHCR)
+
+```bash
+docker pull ghcr.io/leonmeijer/litellm-reasoning-proxy:latest
+docker run -d \
+  -e UPSTREAM_URL=https://litellm.your-domain.com \
+  -e NODE_TLS_REJECT_UNAUTHORIZED=0 \
+  -p 8081:8081 \
+  ghcr.io/leonmeijer/litellm-reasoning-proxy:latest
+```
+
 ### Docker / Podman
 
 ```bash
-docker build -t reasoning-proxy .
+# Required because the Containerfile uses Docker Hardened Images
+docker login dhi.io
+
+docker build -f Containerfile -t reasoning-proxy .
 docker run -d \
   -e UPSTREAM_URL=https://litellm.your-domain.com \
   -e NODE_TLS_REJECT_UNAUTHORIZED=0 \
@@ -136,7 +150,7 @@ spec:
               name: litellm-credentials
               key: api-key
     - name: reasoning-proxy
-      image: reasoning-proxy:latest
+      image: ghcr.io/leonmeijer/litellm-reasoning-proxy:latest
       ports:
         - containerPort: 8081
       env:
@@ -167,7 +181,7 @@ spec:
     spec:
       containers:
         - name: proxy
-          image: reasoning-proxy:latest
+          image: ghcr.io/leonmeijer/litellm-reasoning-proxy:latest
           ports:
             - containerPort: 8081
           env:
@@ -195,6 +209,7 @@ All configuration is via environment variables. No config files, no key manageme
 | Variable                         | Default                  | Description                                                    |
 |----------------------------------|--------------------------|----------------------------------------------------------------|
 | `UPSTREAM_URL`                   | `http://localhost:4000`  | LiteLLM base URL (no trailing slash)                          |
+| `UPSTREAM_CA_FILE`               | `/app/root-ca.crt`       | PEM file used as the custom upstream CA bundle; set to empty to disable it |
 | `PORT`                           | `8081`                   | Proxy listen port                                              |
 | `DEBUG`                          | `0`                      | Set to `1` to log every request and transformation            |
 | `NODE_TLS_REJECT_UNAUTHORIZED`   | `1`                      | Set to `0` to skip TLS verification (self-signed certs)       |
@@ -247,9 +262,9 @@ If a response contains no `reasoning_content` and no `thinking_delta` events (e.
 For environments with internal PKI (self-signed or private CA), the proxy supports two approaches:
 
 1. **Skip verification**: Set `NODE_TLS_REJECT_UNAUTHORIZED=0` (recommended for dev/internal networks)
-2. **Custom CA**: Replace `root-ca.crt` in the repository with your own CA certificate. The Containerfile copies it into the system trust store via `update-ca-certificates`.
+2. **Custom CA**: Replace `root-ca.crt` in the repository or point `UPSTREAM_CA_FILE` at another PEM file. The proxy passes that certificate to Bun's upstream TLS config directly, so the runtime no longer depends on `update-ca-certificates`.
 
-If you don't need a custom CA, remove the `COPY root-ca.crt` and `RUN update-ca-certificates` lines from the Containerfile.
+If your upstream uses the default public CA bundle only, set `UPSTREAM_CA_FILE=` to disable the custom CA file and fall back to Bun's built-in trust store.
 
 ## Health Check
 
@@ -269,6 +284,21 @@ Useful for Kubernetes liveness/readiness probes.
 
 - [Bun](https://bun.sh) runtime (v1.0+)
 - A running LiteLLM instance with at least one reasoning model configured
+
+## GitHub Releases and Images
+
+The repository now includes GitHub Actions workflows for Docker image publication and releases:
+
+- `build-and-publish.yml` publishes `ghcr.io/leonmeijer/litellm-reasoning-proxy`
+- `release.yml` creates a manual release and bootstrap tag
+- `release-please.yml` automates changelog and subsequent releases after the first `v*` tag exists
+
+CI expects these repository secrets:
+
+- `DOCKERHUB_USERNAME`
+- `DOCKERHUB_TOKEN`
+
+The first release is bootstrapped manually from the GitHub Actions UI by running `Create Release` with version `1.0.0`.
 
 ## License
 

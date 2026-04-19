@@ -1,0 +1,89 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_call:
+    inputs:
+      version:
+        description: "Version tag (e.g., v1.0.0 or 1.0.0)"
+        required: false
+        type: string
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/litellm-reasoning-proxy
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hardened Images
+        uses: docker/login-action@v3
+        with:
+          registry: dhi.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve image tags
+        id: tags
+        shell: bash
+        run: |
+          RAW_VERSION="${{ inputs.version }}"
+          if [ -z "$RAW_VERSION" ]; then
+            RAW_VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+
+          if [ -z "$RAW_VERSION" ]; then
+            echo "No version input or tag ref available" >&2
+            exit 1
+          fi
+
+          case "$RAW_VERSION" in
+            v*) TAG="$RAW_VERSION" ;;
+            *) TAG="v$RAW_VERSION" ;;
+          esac
+
+          BASE_TAG="${TAG%%-*}"
+          MINOR_TAG="${BASE_TAG%.*}"
+
+          {
+            echo "full=$TAG"
+            echo "minor=$MINOR_TAG"
+            echo "tags<<EOF"
+            echo "${IMAGE_NAME}:${TAG}"
+            echo "${IMAGE_NAME}:${GITHUB_SHA}"
+            if [[ "$TAG" != *-* ]]; then
+              echo "${IMAGE_NAME}:${MINOR_TAG}"
+              echo "${IMAGE_NAME}:latest"
+            fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Containerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          platforms: linux/amd64

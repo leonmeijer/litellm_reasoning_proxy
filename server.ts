@@ -1,3 +1,5 @@
+import { existsSync } from "node:fs"
+
 /**
  * Reasoning Proxy — transforms LiteLLM responses into exact Anthropic /v1/messages format.
  *
@@ -10,6 +12,7 @@
  */
 
 const UPSTREAM = process.env.UPSTREAM_URL || "http://localhost:4000"
+const UPSTREAM_CA_FILE = process.env.UPSTREAM_CA_FILE ?? "/app/root-ca.crt"
 const PORT = parseInt(process.env.PORT || "8081", 10)
 const LOG_DEBUG = process.env.DEBUG === "1"
 const TLS_REJECT = process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0"
@@ -18,10 +21,26 @@ function log(...args: unknown[]) {
   if (LOG_DEBUG) console.log("[reasoning-proxy]", ...args)
 }
 
-/** Common fetch options — disables TLS verify when NODE_TLS_REJECT_UNAUTHORIZED=0 */
-const fetchOpts: RequestInit & { tls?: { rejectUnauthorized?: boolean } } = {
-  tls: { rejectUnauthorized: TLS_REJECT },
-} as unknown as RequestInit
+type FetchTlsOptions = {
+  rejectUnauthorized?: boolean
+  ca?: ReturnType<typeof Bun.file>[]
+}
+
+/** Common fetch options — optionally pins a custom CA for upstream TLS. */
+const fetchTls: FetchTlsOptions = {
+  rejectUnauthorized: TLS_REJECT,
+}
+
+if (TLS_REJECT && UPSTREAM_CA_FILE && existsSync(UPSTREAM_CA_FILE)) {
+  fetchTls.ca = [Bun.file(UPSTREAM_CA_FILE)]
+  log("using upstream CA file", UPSTREAM_CA_FILE)
+} else if (TLS_REJECT && UPSTREAM_CA_FILE) {
+  log("upstream CA file not found, falling back to Bun defaults", UPSTREAM_CA_FILE)
+}
+
+const fetchOpts: RequestInit & { tls?: FetchTlsOptions } = {
+  tls: fetchTls,
+} as RequestInit & { tls?: FetchTlsOptions }
 
 // ─── Non-streaming response transform ───────────────────────────────────────
 
