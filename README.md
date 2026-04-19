@@ -103,6 +103,8 @@ export ANTHROPIC_BASE_URL=http://localhost:8081
 
 ### Pre-built image (GHCR)
 
+Published images support both `linux/amd64` and `linux/arm64`. On Apple Silicon Macs, Docker will pull the `linux/arm64` variant automatically.
+
 ```bash
 docker pull ghcr.io/leonmeijer/litellm-reasoning-proxy:latest
 docker run -d \
@@ -290,6 +292,7 @@ Useful for Kubernetes liveness/readiness probes.
 The repository now includes GitHub Actions workflows for Docker image publication and releases:
 
 - `build-and-publish.yml` publishes `ghcr.io/leonmeijer/litellm-reasoning-proxy`
+  It publishes a multi-arch image manifest for `linux/amd64` and `linux/arm64`.
 - `release.yml` creates a manual release and bootstrap tag
 - `release-please.yml` automates changelog and subsequent releases after the first `v*` tag exists
 
