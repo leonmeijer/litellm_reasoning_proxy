@@ -11,7 +11,8 @@ import { existsSync } from "node:fs"
  *   - Non-streaming: content: [{type:"thinking",...}, {type:"text",...}]
  */
 
-const UPSTREAM = process.env.UPSTREAM_URL || "http://localhost:4000"
+const TARGET_QUERY_PARAM = "target"
+const UPSTREAM = normalizeUpstream(process.env.UPSTREAM_URL || "http://localhost:4000")
 const UPSTREAM_CA_FILE = process.env.UPSTREAM_CA_FILE ?? "/app/root-ca.crt"
 const PORT = parseInt(process.env.PORT || "8081", 10)
 const LOG_DEBUG = process.env.DEBUG === "1"
@@ -19,6 +20,43 @@ const TLS_REJECT = process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0"
 
 function log(...args: unknown[]) {
   if (LOG_DEBUG) console.log("[reasoning-proxy]", ...args)
+}
+
+function normalizeUpstream(value: string): string {
+  return value.endsWith("/") ? value.slice(0, -1) : value
+}
+
+function resolveUpstream(url: URL): string {
+  const target = url.searchParams.get(TARGET_QUERY_PARAM)?.trim()
+  if (!target) return UPSTREAM
+
+  let parsed: URL
+  try {
+    parsed = new URL(target)
+  } catch {
+    throw new Error(`invalid ${TARGET_QUERY_PARAM} query parameter: expected absolute http(s) URL`)
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`invalid ${TARGET_QUERY_PARAM} query parameter: only http(s) URLs are supported`)
+  }
+
+  return normalizeUpstream(parsed.toString())
+}
+
+function buildUpstreamUrl(upstream: string, url: URL, includeSearch: boolean): string {
+  const upstreamSearch = new URLSearchParams(url.search)
+  upstreamSearch.delete(TARGET_QUERY_PARAM)
+
+  const search = includeSearch && upstreamSearch.size > 0 ? `?${upstreamSearch.toString()}` : ""
+  return `${upstream}${url.pathname}${search}`
+}
+
+function badRequest(message: string): Response {
+  return new Response(JSON.stringify({ error: message }), {
+    status: 400,
+    headers: { "content-type": "application/json" },
+  })
 }
 
 type FetchTlsOptions = {
@@ -395,10 +433,17 @@ const server = Bun.serve({
   port: PORT,
   async fetch(req) {
     const url = new URL(req.url)
+    let upstream: string
+
+    try {
+      upstream = resolveUpstream(url)
+    } catch (error) {
+      return badRequest(error instanceof Error ? error.message : "invalid target URL")
+    }
 
     // Health check
     if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", upstream: UPSTREAM }), {
+      return new Response(JSON.stringify({ status: "ok", upstream }), {
         headers: { "content-type": "application/json" },
       })
     }
@@ -406,14 +451,14 @@ const server = Bun.serve({
     // Only handle /v1/messages POST
     if (url.pathname !== "/v1/messages" && url.pathname !== "/v1/messages/") {
       // Proxy everything else transparently
-      return proxyRequest(req, url)
+      return proxyRequest(req, url, upstream)
     }
 
     if (req.method !== "POST") {
-      return proxyRequest(req, url)
+      return proxyRequest(req, url, upstream)
     }
 
-    log(`${req.method} ${url.pathname}`)
+    log(`${req.method} ${url.pathname}`, `upstream=${upstream}`)
 
     // Read the request body
     const body = await req.json()
@@ -422,7 +467,7 @@ const server = Bun.serve({
     log(`streaming=${isStreaming}, model=${body.model}`)
 
     // Build upstream URL
-    const upstreamUrl = `${UPSTREAM}${url.pathname}`
+    const upstreamUrl = buildUpstreamUrl(upstream, url, true)
 
     // Forward headers (strip host, add required)
     const headers: Record<string, string> = {}
@@ -441,8 +486,8 @@ const server = Bun.serve({
   },
 })
 
-async function proxyRequest(req: Request, url: URL): Promise<Response> {
-  const upstreamUrl = `${UPSTREAM}${url.pathname}${url.search}`
+async function proxyRequest(req: Request, url: URL, upstream: string): Promise<Response> {
+  const upstreamUrl = buildUpstreamUrl(upstream, url, true)
   const headers: Record<string, string> = {}
   for (const [key, value] of req.headers.entries()) {
     const lower = key.toLowerCase()

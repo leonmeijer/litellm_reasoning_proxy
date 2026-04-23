@@ -101,6 +101,14 @@ ANTHROPIC_BASE_URL=http://localhost:8081 claude
 export ANTHROPIC_BASE_URL=http://localhost:8081
 ```
 
+If you want to choose the LiteLLM target per request instead of via config, append `?target=` to the proxy base URL:
+
+```bash
+ANTHROPIC_BASE_URL='http://localhost:8081?target=https%3A%2F%2Flitellm-a.internal%3A4000' claude
+```
+
+If `target` is omitted, the proxy falls back to `UPSTREAM_URL`.
+
 ### Pre-built image (GHCR)
 
 Published images support both `linux/amd64` and `linux/arm64`. On Apple Silicon Macs, Docker will pull the `linux/arm64` variant automatically.
@@ -217,6 +225,20 @@ All configuration is via environment variables. No config files, no key manageme
 | `NODE_TLS_REJECT_UNAUTHORIZED`   | `1`                      | Set to `0` to skip TLS verification (self-signed certs)       |
 
 API keys from incoming `x-api-key` and `Authorization` headers are forwarded to LiteLLM as-is. The proxy never stores or manages credentials.
+
+### Per-request target override
+
+You can override the configured upstream by passing `target` in the query string:
+
+```text
+POST /v1/messages?target=https%3A%2F%2Flitellm-b.internal%3A4000
+```
+
+Rules:
+
+- `target` must be an absolute `http://` or `https://` URL
+- if `target` is missing, `UPSTREAM_URL` is used
+- `target` itself is never forwarded to the upstream, but other query parameters are preserved
 
 ## How It Works
 
