@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.0.1...v1.1.0) (2026-04-23)
+
+
+### Features
+
+* add per-request upstream target override via ?target= query param ([592e4e2](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/592e4e2c20e74f419a969e57f3536aee22ea720a))
+
 ## [1.0.1](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.0.0...v1.0.1) (2026-04-19)
 
 
