@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.1](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.1.0...v1.1.1) (2026-04-25)
+
+
+### Bug Fixes
+
+* repair mixed text+tool_use assistant messages before forwarding ([2b063dc](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/2b063dc2245c9476e95f59cdd9a73ec062426516))
+* route streaming through OpenAI endpoint to fix duplicate SSE events ([4318214](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/431821443c49121e551d67604924f0a6f25dfd3e))
+
 ## [1.1.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.0.1...v1.1.0) (2026-04-23)
 
 
