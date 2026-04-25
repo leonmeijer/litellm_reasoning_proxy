@@ -382,12 +382,41 @@ async function proxyRequest(req: Request, url: URL, upstream: string): Promise<R
   })
 }
 
+// ─── Request repair: fix mixed text+tool_use in assistant messages ──────────
+//
+// LiteLLM fails to transform assistant messages that contain both text and
+// tool_use content blocks when converting from Anthropic to OpenAI format.
+// The Anthropic API itself accepts this fine. Fix: strip text blocks from
+// assistant messages when tool_use blocks are present — the text was already
+// streamed to the client and isn't needed for conversation continuity.
+
+function repairToolUseMessages(body: Record<string, unknown>): void {
+  const messages = body.messages as Array<Record<string, unknown>> | undefined
+  if (!messages) return
+
+  for (const msg of messages) {
+    if (msg.role !== "assistant") continue
+    const content = msg.content as Array<Record<string, unknown>> | undefined
+    if (!Array.isArray(content)) continue
+
+    const hasToolUse = content.some((b) => b.type === "tool_use")
+    if (!hasToolUse) continue
+
+    const hasText = content.some((b) => b.type === "text")
+    if (!hasText) continue
+
+    msg.content = content.filter((b) => b.type !== "text")
+    log("repaired mixed text+tool_use in assistant message")
+  }
+}
+
 async function handleMessages(
   req: Request,
   url: URL,
   upstream: string,
 ): Promise<Response> {
   const body = await req.json()
+  repairToolUseMessages(body)
   const isStreaming = body.stream === true
 
   log(`${req.method} /v1/messages streaming=${isStreaming} model=${body.model}`)
