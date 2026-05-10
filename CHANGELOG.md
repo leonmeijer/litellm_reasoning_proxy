@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.5.0...v1.6.0) (2026-05-11)
+
+
+### Features
+
+* tool calling (function-calling) support across the Anthropic ↔ OpenAI bridge:
+  - request side: forward `tools` schema (Anthropic `input_schema` → OpenAI `function.parameters`) and `tool_choice` (auto / any → required / none / specific tool)
+  - request side: assistant message with `tool_use` content blocks → OpenAI `{content, tool_calls:[{id, function:{name, arguments}}]}`
+  - request side: user message with `tool_result` content blocks → one `{role:"tool", tool_call_id, content}` message per result, plus a user text message for any remaining text
+  - response side (streaming): convert OpenAI `tool_calls` deltas into Anthropic `content_block_start(tool_use)` + `input_json_delta(partial_json)` + `content_block_stop`, with proper index allocation across thinking / text / tool blocks
+  - response side (non-streaming): aggregate tool calls into `tool_use` content blocks with parsed JSON `input`
+  - `stop_reason` correctly resolves to `tool_use` when tool calls are present (or upstream returned `finish_reason: tool_calls`)
+* drop the legacy `repairToolUseMessages` workaround — no longer needed now that the proxy emits canonical OpenAI `content + tool_calls` instead of forwarding mixed Anthropic blocks verbatim
+
 ## [1.5.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.4.0...v1.5.0) (2026-05-11)
 
 

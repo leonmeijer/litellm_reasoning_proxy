@@ -107,6 +107,35 @@ function extractSystemText(value: unknown): string | undefined {
   return undefined
 }
 
+type OpenAIMsg = {
+  role: string
+  content?: string | null
+  tool_calls?: Array<{
+    id: string
+    type: "function"
+    function: { name: string; arguments: string }
+  }>
+  tool_call_id?: string
+}
+
+function extractText(blocks: Array<Record<string, unknown>>): string {
+  return blocks
+    .filter((b) => b.type === "text")
+    .map((b) => (b.text as string | undefined) ?? "")
+    .join("\n")
+}
+
+function toolResultContent(raw: unknown): string {
+  if (typeof raw === "string") return raw
+  if (Array.isArray(raw)) {
+    return (raw as Array<Record<string, unknown>>)
+      .filter((b) => b.type === "text")
+      .map((b) => (b.text as string | undefined) ?? "")
+      .join("\n")
+  }
+  return JSON.stringify(raw ?? "")
+}
+
 function anthropicToOpenAI(
   body: Record<string, unknown>,
   apiKey: string,
@@ -116,7 +145,7 @@ function anthropicToOpenAI(
   const modelName = (body.model as string) ?? ""
   const stripsSystem = NO_SYSTEM_ROLE.test(modelName)
 
-  const openaiMessages: Array<{ role: string; content: string }> = []
+  const openaiMessages: Array<OpenAIMsg> = []
   let pendingSystem = stripsSystem ? system : undefined
 
   if (system && !stripsSystem) {
@@ -124,14 +153,58 @@ function anthropicToOpenAI(
   }
 
   for (const msg of messages) {
+    // Assistant: may carry tool_use blocks → emit OpenAI tool_calls
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const blocks = msg.content as Array<Record<string, unknown>>
+      const text = extractText(blocks)
+      const toolUses = blocks.filter((b) => b.type === "tool_use")
+      const m: OpenAIMsg = { role: "assistant" }
+      if (text) m.content = text
+      if (toolUses.length > 0) {
+        m.tool_calls = toolUses.map((tu) => ({
+          id: (tu.id as string) ?? `call_${crypto.randomUUID()}`,
+          type: "function" as const,
+          function: {
+            name: (tu.name as string) ?? "",
+            arguments: JSON.stringify(tu.input ?? {}),
+          },
+        }))
+      }
+      if (m.content === undefined && !m.tool_calls) continue
+      openaiMessages.push(m)
+      continue
+    }
+
+    // User: may carry tool_result blocks → emit one role:tool per result,
+    // plus a single user message for any text afterwards.
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const blocks = msg.content as Array<Record<string, unknown>>
+      for (const b of blocks) {
+        if (b.type !== "tool_result") continue
+        openaiMessages.push({
+          role: "tool",
+          tool_call_id: (b.tool_use_id as string) ?? "",
+          content: toolResultContent(b.content),
+        })
+      }
+      const text = extractText(blocks)
+      if (text || pendingSystem) {
+        let content = text
+        if (pendingSystem) {
+          content = content ? `${pendingSystem}\n\n${content}` : pendingSystem
+          pendingSystem = undefined
+        }
+        openaiMessages.push({ role: "user", content })
+      }
+      continue
+    }
+
+    // Plain string / unknown shape.
     let content: string
     if (typeof msg.content === "string") {
       content = msg.content
     } else if (Array.isArray(msg.content)) {
-      content = msg.content
-        .filter((b) => b.type === "text")
-        .map((b) => b.text ?? "")
-        .join("\n")
+      content = extractText(msg.content as Array<Record<string, unknown>>)
     } else {
       content = String(msg.content)
     }
@@ -144,8 +217,6 @@ function anthropicToOpenAI(
     openaiMessages.push({ role: msg.role, content })
   }
 
-  // If no user message was found (assistant-only continuation), surface
-  // the system prompt as a user message so it isn't silently dropped.
   if (pendingSystem) {
     openaiMessages.unshift({ role: "user", content: pendingSystem })
   }
@@ -161,6 +232,46 @@ function anthropicToOpenAI(
   if (body.top_p !== undefined) openaiBody.top_p = body.top_p
   if (body.stop_sequences) openaiBody.stop = body.stop_sequences
 
+  // Tools schema: Anthropic → OpenAI function-calling.
+  if (Array.isArray(body.tools)) {
+    const tools = (body.tools as Array<Record<string, unknown>>)
+      .map((t) => ({
+        type: "function" as const,
+        function: {
+          name: (t.name as string) ?? "",
+          description: (t.description as string) ?? "",
+          parameters:
+            (t.input_schema as Record<string, unknown>) ?? {
+              type: "object",
+              properties: {},
+            },
+        },
+      }))
+      .filter((t) => t.function.name)
+    if (tools.length > 0) openaiBody.tools = tools
+  }
+
+  if (body.tool_choice !== undefined) {
+    const tc = body.tool_choice as unknown
+    if (typeof tc === "string") {
+      openaiBody.tool_choice = tc === "any" ? "required" : tc
+    } else if (tc && typeof tc === "object") {
+      const obj = tc as Record<string, unknown>
+      if (obj.type === "tool" && typeof obj.name === "string") {
+        openaiBody.tool_choice = {
+          type: "function",
+          function: { name: obj.name },
+        }
+      } else if (obj.type === "auto") {
+        openaiBody.tool_choice = "auto"
+      } else if (obj.type === "any") {
+        openaiBody.tool_choice = "required"
+      } else if (obj.type === "none") {
+        openaiBody.tool_choice = "none"
+      }
+    }
+  }
+
   const headers: Record<string, string> = {
     "content-type": "application/json",
     authorization: `Bearer ${apiKey}`,
@@ -171,9 +282,17 @@ function anthropicToOpenAI(
 
 // ─── Streaming chunk parser shared between Anthropic and OpenAI outputs ───
 
+interface ParsedToolCallDelta {
+  index: number
+  id?: string
+  name?: string
+  argumentsDelta?: string
+}
+
 interface ParsedDelta {
   reasoning?: string
   content?: string
+  toolCalls?: ParsedToolCallDelta[]
   finishReason?: string | null
   id?: string
   model?: string
@@ -205,11 +324,26 @@ function parseOpenAIChunk(line: string): { done: boolean; delta?: ParsedDelta } 
     (delta.thinking as string | undefined) ??
     (delta.reasoning as string | undefined)
 
+  let toolCalls: ParsedToolCallDelta[] | undefined
+  const rawToolCalls = delta.tool_calls as Array<Record<string, unknown>> | undefined
+  if (Array.isArray(rawToolCalls) && rawToolCalls.length > 0) {
+    toolCalls = rawToolCalls.map((tc) => {
+      const fn = (tc.function as Record<string, unknown> | undefined) ?? {}
+      return {
+        index: (tc.index as number) ?? 0,
+        id: tc.id as string | undefined,
+        name: fn.name as string | undefined,
+        argumentsDelta: fn.arguments as string | undefined,
+      }
+    })
+  }
+
   return {
     done: false,
     delta: {
       reasoning,
       content: delta.content as string | undefined,
+      toolCalls,
       finishReason: choice?.finish_reason as string | null | undefined,
       id: parsed.id as string | undefined,
       model: parsed.model as string | undefined,
@@ -224,12 +358,23 @@ function formatSSE(event: string, data: string): string {
   return `event: ${event}\ndata: ${data}\n\n`
 }
 
+interface ToolCallState {
+  anthropicIndex: number
+  id: string
+  name: string
+  argsBuffer: string
+  open: boolean
+}
+
 class OpenAIToAnthropicStream {
   private sentMessageStart = false
   private thinkingOpen = false
+  private thinkingIndex = -1
   private textOpen = false
-  private textIndex = 0
+  private textIndex = -1
   private finished = false
+  private nextAnthropicIndex = 0
+  private toolCallStates = new Map<number, ToolCallState>()
   private requestModel: string
   private upstreamId = ""
   private inputTokens = 0
@@ -245,6 +390,22 @@ class OpenAIToAnthropicStream {
 
   constructor(requestModel: string) {
     this.requestModel = requestModel
+  }
+
+  private allocateIndex(): number {
+    return this.nextAnthropicIndex++
+  }
+
+  private closeTextBlockIfOpen(): string[] {
+    if (!this.textOpen) return []
+    const out = [
+      formatSSE(
+        "content_block_stop",
+        JSON.stringify({ type: "content_block_stop", index: this.textIndex }),
+      ),
+    ]
+    this.textOpen = false
+    return out
   }
 
   ingest(line: string): string[] {
@@ -270,12 +431,13 @@ class OpenAIToAnthropicStream {
       this.sawReasoning = true
       this.accumulatedThinking += delta.reasoning
       if (!this.thinkingOpen) {
+        this.thinkingIndex = this.allocateIndex()
         out.push(
           formatSSE(
             "content_block_start",
             JSON.stringify({
               type: "content_block_start",
-              index: 0,
+              index: this.thinkingIndex,
               content_block: { type: "thinking", thinking: "" },
             }),
           ),
@@ -287,7 +449,7 @@ class OpenAIToAnthropicStream {
           "content_block_delta",
           JSON.stringify({
             type: "content_block_delta",
-            index: 0,
+            index: this.thinkingIndex,
             delta: { type: "thinking_delta", thinking: delta.reasoning },
           }),
         ),
@@ -299,10 +461,10 @@ class OpenAIToAnthropicStream {
       // Anthropic SSE contract: text_delta belongs on its own block.
       if (this.thinkingOpen && !this.textOpen) {
         out.push(...this.closeThinkingBlock())
-        this.textIndex = 1
       }
       this.accumulatedText += delta.content
       if (!this.textOpen) {
+        this.textIndex = this.allocateIndex()
         out.push(
           formatSSE(
             "content_block_start",
@@ -325,6 +487,63 @@ class OpenAIToAnthropicStream {
           }),
         ),
       )
+    }
+
+    if (delta.toolCalls && delta.toolCalls.length > 0) {
+      // Close any open text/thinking block before opening tool_use blocks —
+      // Anthropic content blocks are sequential, not interleaved.
+      if (this.thinkingOpen) out.push(...this.closeThinkingBlock())
+      out.push(...this.closeTextBlockIfOpen())
+
+      for (const tc of delta.toolCalls) {
+        let entry = this.toolCallStates.get(tc.index)
+        if (!entry) {
+          entry = {
+            anthropicIndex: this.allocateIndex(),
+            id: tc.id ?? `toolu_${crypto.randomUUID().replace(/-/g, "").slice(0, 24)}`,
+            name: tc.name ?? "",
+            argsBuffer: "",
+            open: false,
+          }
+          this.toolCallStates.set(tc.index, entry)
+        } else {
+          if (tc.id && !entry.id.length) entry.id = tc.id
+          if (tc.name && !entry.name.length) entry.name = tc.name
+        }
+
+        if (!entry.open) {
+          out.push(
+            formatSSE(
+              "content_block_start",
+              JSON.stringify({
+                type: "content_block_start",
+                index: entry.anthropicIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: entry.id,
+                  name: entry.name,
+                  input: {},
+                },
+              }),
+            ),
+          )
+          entry.open = true
+        }
+
+        if (tc.argumentsDelta) {
+          entry.argsBuffer += tc.argumentsDelta
+          out.push(
+            formatSSE(
+              "content_block_delta",
+              JSON.stringify({
+                type: "content_block_delta",
+                index: entry.anthropicIndex,
+                delta: { type: "input_json_delta", partial_json: tc.argumentsDelta },
+              }),
+            ),
+          )
+        }
+      }
     }
 
     if (delta.finishReason) {
@@ -373,7 +592,7 @@ class OpenAIToAnthropicStream {
         "content_block_delta",
         JSON.stringify({
           type: "content_block_delta",
-          index: 0,
+          index: this.thinkingIndex,
           delta: { type: "signature_delta", signature: "" },
         }),
       ),
@@ -381,11 +600,19 @@ class OpenAIToAnthropicStream {
     out.push(
       formatSSE(
         "content_block_stop",
-        JSON.stringify({ type: "content_block_stop", index: 0 }),
+        JSON.stringify({ type: "content_block_stop", index: this.thinkingIndex }),
       ),
     )
     this.thinkingOpen = false
     return out
+  }
+
+  private resolveStopReason(): string {
+    if (this.toolCallStates.size > 0 || this.finalFinishReason === "tool_calls") {
+      return "tool_use"
+    }
+    if (this.finalFinishReason === "length") return "max_tokens"
+    return "end_turn"
   }
 
   finish(reason?: string): string[] {
@@ -401,39 +628,46 @@ class OpenAIToAnthropicStream {
       out.push(...this.closeThinkingBlock())
     }
 
-    if (!this.textOpen && !this.sawReasoning) {
+    if (
+      !this.textOpen &&
+      !this.sawReasoning &&
+      this.toolCallStates.size === 0
+    ) {
       // Empty response — give clients an empty text block so parsers don't trip.
+      this.textIndex = this.allocateIndex()
       out.push(
         formatSSE(
           "content_block_start",
           JSON.stringify({
             type: "content_block_start",
-            index: 0,
+            index: this.textIndex,
             content_block: { type: "text", text: "" },
           }),
         ),
       )
       this.textOpen = true
-      this.textIndex = 0
     }
 
-    if (this.textOpen) {
-      out.push(
-        formatSSE(
-          "content_block_stop",
-          JSON.stringify({ type: "content_block_stop", index: this.textIndex }),
-        ),
-      )
-      this.textOpen = false
+    out.push(...this.closeTextBlockIfOpen())
+
+    for (const entry of this.toolCallStates.values()) {
+      if (entry.open) {
+        out.push(
+          formatSSE(
+            "content_block_stop",
+            JSON.stringify({ type: "content_block_stop", index: entry.anthropicIndex }),
+          ),
+        )
+        entry.open = false
+      }
     }
 
-    const stopReason = this.finalFinishReason === "length" ? "max_tokens" : "end_turn"
     out.push(
       formatSSE(
         "message_delta",
         JSON.stringify({
           type: "message_delta",
-          delta: { stop_reason: stopReason, stop_sequence: null },
+          delta: { stop_reason: this.resolveStopReason(), stop_sequence: null },
           usage: { output_tokens: this.outputTokens },
         }),
       ),
@@ -452,7 +686,32 @@ class OpenAIToAnthropicStream {
         signature: "",
       })
     }
-    content.push({ type: "text", text: this.accumulatedText })
+    if (this.accumulatedText) {
+      content.push({ type: "text", text: this.accumulatedText })
+    }
+    // Emit tool_use blocks in the order they were seen (by openai index).
+    const orderedTools = Array.from(this.toolCallStates.entries()).sort(
+      (a, b) => a[0] - b[0],
+    )
+    for (const [, entry] of orderedTools) {
+      let input: unknown = {}
+      if (entry.argsBuffer) {
+        try {
+          input = JSON.parse(entry.argsBuffer)
+        } catch {
+          input = { _raw: entry.argsBuffer }
+        }
+      }
+      content.push({
+        type: "tool_use",
+        id: entry.id,
+        name: entry.name,
+        input,
+      })
+    }
+    if (content.length === 0) {
+      content.push({ type: "text", text: "" })
+    }
 
     return {
       id: this.upstreamId || `msg_${crypto.randomUUID()}`,
@@ -460,7 +719,7 @@ class OpenAIToAnthropicStream {
       role: "assistant",
       model: this.requestModel,
       content,
-      stop_reason: this.finalFinishReason === "length" ? "max_tokens" : "end_turn",
+      stop_reason: this.resolveStopReason(),
       stop_sequence: null,
       usage: {
         input_tokens: this.inputTokens,
@@ -630,26 +889,6 @@ async function consumeStream(
   if (buffer.trim()) await onLine(buffer.trim())
 }
 
-// ─── Request repair: fix mixed text+tool_use in assistant messages ──────────
-// LiteLLM fails to transform assistant messages that contain both text and
-// tool_use content blocks when converting from Anthropic to OpenAI format.
-
-function repairToolUseMessages(body: Record<string, unknown>): void {
-  const messages = body.messages as Array<Record<string, unknown>> | undefined
-  if (!messages) return
-
-  for (const msg of messages) {
-    if (msg.role !== "assistant") continue
-    const content = msg.content as Array<Record<string, unknown>> | undefined
-    if (!Array.isArray(content)) continue
-    const hasToolUse = content.some((b) => b.type === "tool_use")
-    const hasText = content.some((b) => b.type === "text")
-    if (!hasToolUse || !hasText) continue
-    msg.content = content.filter((b) => b.type !== "text")
-    log("repaired mixed text+tool_use in assistant message")
-  }
-}
-
 // ─── Common upstream call ───────────────────────────────────────────────────
 
 async function callUpstreamStream(
@@ -735,7 +974,6 @@ async function handleAnthropicMessages(
   upstream: string,
 ): Promise<Response> {
   const body = (await req.json()) as Record<string, unknown>
-  repairToolUseMessages(body)
   const isStreaming = body.stream === true
 
   const apiKey =
