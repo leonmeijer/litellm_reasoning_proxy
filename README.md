@@ -47,7 +47,7 @@ The Anthropic SDK expects `thinking_delta` on a `type: "thinking"` block and `te
 
 ## What This Proxy Does
 
-Sits between your Anthropic API client and LiteLLM. Passes requests and API keys through unchanged. Rewrites only the response to match the Anthropic `/v1/messages` format:
+Sits between your client and LiteLLM, handling both Anthropic (`/v1/messages`) and OpenAI (`/v1/chat/completions`) request formats. Passes requests and API keys through unchanged. Rewrites only the response so reasoning is surfaced correctly in whichever format the client asked for:
 
 | LiteLLM sends                                         | Proxy outputs (Anthropic format)                                        |
 |-------------------------------------------------------|-------------------------------------------------------------------------|
@@ -277,9 +277,21 @@ Checks for `reasoning_content` at the message level or inside content blocks, th
 }
 ```
 
+### OpenAI streaming and non-streaming path
+
+Both streaming and non-streaming OpenAI requests are driven upstream as `stream=true` and re-aggregated by the proxy. The aggregator:
+
+- normalizes reasoning under both `reasoning_content` and `reasoning` so any client convention works
+- preserves unknown delta fields (`tool_calls`, `role`, `refusal`, …) via pass-through spread — nothing is dropped
+- synthesizes a final `finish_reason: stop` chunk if the upstream stream closes without one
+- guarantees a `data: [DONE]` terminator
+- tracks whether the upstream already emitted a usage chunk and skips its own synthetic one if so
+
+This closes the LiteLLM 1.83.14 aggregator bug where chatgpt-subs and other `/responses → /chat` bridges silently strip content on non-streamed responses, and protects streaming clients from upstreams that omit terminators or finish reasons.
+
 ### Passthrough behavior
 
-If a response contains no `reasoning_content` and no `thinking_delta` events (e.g. non-reasoning models like `claude-sonnet` without thinking, or `gpt-4o`), the proxy passes everything through unchanged. Zero overhead for models that already work correctly.
+If a response contains no `reasoning_content` and no `thinking_delta` events (e.g. non-reasoning models like `claude-sonnet` without thinking, or `gpt-4o`), the proxy still drives upstream as streaming for safety but otherwise passes content through unchanged. Effectively zero overhead for models that already work correctly.
 
 ## TLS and Custom CA Certificates
 

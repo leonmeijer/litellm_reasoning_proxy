@@ -1,11 +1,17 @@
 # Changelog
 
-## [1.2.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.1.1...v1.2.0) (2026-05-10)
+## [1.4.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.3.0...v1.4.0) (2026-05-11)
 
 
 ### Features
 
 * route OpenAI streaming through reasoning aggregator ([3993733](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/3993733df7409edb196f2389b4a3c17988ebabac))
+
+## [1.3.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.1.1...v1.3.0) (2026-04-30)
+
+
+### Features
+
 * surface reasoning/thinking across all 4 paths ([c2a6172](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/c2a6172349604a1a1b8bfdd1064e26e35130849e))
 
 ## [1.1.1](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.1.0...v1.1.1) (2026-04-25)
