@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.5.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.4.0...v1.5.0) (2026-05-11)
+
+
+### Features
+
+* fold system prompt into first user message for `openai/gpt-5-*` models so ChatGPT-subscription backends (which reject `role:"system"` with "System messages are not allowed") become usable for agentic Claude Code clients
+* also handle Anthropic-style array system prompts (`[{"type":"text","text":"…"}]`)
+
 ## [1.4.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.3.0...v1.4.0) (2026-05-11)
 
 

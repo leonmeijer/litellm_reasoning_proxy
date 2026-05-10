@@ -89,16 +89,37 @@ interface AnthropicMessage {
   content: string | Array<{ type: string; text?: string; [k: string]: unknown }>
 }
 
+// Models whose LiteLLM backend rejects role:"system" messages (e.g.
+// chatgpt-sub via /responses for openai/gpt-5-*: "System messages are not
+// allowed"). For these we fold the system prompt into the first user
+// message so agentic clients like Claude Code work.
+const NO_SYSTEM_ROLE = /^openai\/gpt-5-/
+
+function extractSystemText(value: unknown): string | undefined {
+  if (typeof value === "string") return value || undefined
+  if (Array.isArray(value)) {
+    const joined = (value as Array<{ type?: string; text?: string }>)
+      .filter((b) => b.type === "text")
+      .map((b) => b.text ?? "")
+      .join("\n")
+    return joined || undefined
+  }
+  return undefined
+}
+
 function anthropicToOpenAI(
   body: Record<string, unknown>,
   apiKey: string,
 ): { body: Record<string, unknown>; headers: Record<string, string> } {
   const messages = body.messages as AnthropicMessage[]
-  const system = body.system as string | undefined
+  const system = extractSystemText(body.system)
+  const modelName = (body.model as string) ?? ""
+  const stripsSystem = NO_SYSTEM_ROLE.test(modelName)
 
   const openaiMessages: Array<{ role: string; content: string }> = []
+  let pendingSystem = stripsSystem ? system : undefined
 
-  if (system) {
+  if (system && !stripsSystem) {
     openaiMessages.push({ role: "system", content: system })
   }
 
@@ -114,7 +135,19 @@ function anthropicToOpenAI(
     } else {
       content = String(msg.content)
     }
+
+    if (pendingSystem && msg.role === "user") {
+      content = `${pendingSystem}\n\n${content}`
+      pendingSystem = undefined
+    }
+
     openaiMessages.push({ role: msg.role, content })
+  }
+
+  // If no user message was found (assistant-only continuation), surface
+  // the system prompt as a user message so it isn't silently dropped.
+  if (pendingSystem) {
+    openaiMessages.unshift({ role: "user", content: pendingSystem })
   }
 
   const openaiBody: Record<string, unknown> = {
