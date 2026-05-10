@@ -208,6 +208,7 @@ class OpenAIToAnthropicStream {
   accumulatedText = ""
   sawReasoning = false
   finalFinishReason: string | null = null
+  upstreamUsageEmitted = false
 
   constructor(requestModel: string) {
     this.requestModel = requestModel
@@ -466,6 +467,107 @@ class OpenAIToAnthropicStream {
       },
     }
   }
+
+  // Streaming OpenAI SSE → normalized OpenAI SSE. Pass-through preserves any
+  // unknown delta fields (tool_calls, role, refusal, …) and only normalizes
+  // reasoning so it surfaces under both `reasoning_content` and `reasoning`.
+  // The aggregator also guarantees a final finish_reason chunk + [DONE].
+  ingestAsOpenAISSE(line: string): string[] {
+    if (this.finished) return []
+    if (!line.startsWith("data: ")) return []
+    const payload = line.slice(6).trim()
+    if (payload === "[DONE]") return this.finishAsOpenAISSE()
+
+    let parsed: Record<string, unknown>
+    try {
+      parsed = JSON.parse(payload)
+    } catch {
+      return []
+    }
+
+    const choices = parsed.choices as Array<Record<string, unknown>> | undefined
+    const choice = choices?.[0] as Record<string, unknown> | undefined
+    const delta = (choice?.delta as Record<string, unknown> | undefined) ?? {}
+
+    if (parsed.id && !this.upstreamId) this.upstreamId = parsed.id as string
+    if (parsed.model) this.requestModel = parsed.model as string
+    if (parsed.usage) {
+      const u = parsed.usage as Record<string, number>
+      if (typeof u.prompt_tokens === "number") this.inputTokens = u.prompt_tokens
+      if (typeof u.completion_tokens === "number") this.outputTokens = u.completion_tokens
+    }
+
+    const reasoning =
+      (delta.reasoning_content as string | undefined) ??
+      (delta.thinking as string | undefined) ??
+      (delta.reasoning as string | undefined)
+
+    if (reasoning) {
+      this.sawReasoning = true
+      this.accumulatedThinking += reasoning
+    }
+    if (delta.content) {
+      this.accumulatedText += delta.content as string
+    }
+    if (choice?.finish_reason) {
+      this.finalFinishReason = choice.finish_reason as string
+    }
+
+    const normalizedDelta: Record<string, unknown> = { ...delta }
+    if (reasoning !== undefined) {
+      normalizedDelta.reasoning_content = reasoning
+      normalizedDelta.reasoning = reasoning
+    }
+
+    const reEmitted: Record<string, unknown> = { ...parsed }
+    if (choice) {
+      reEmitted.choices = [{ ...choice, delta: normalizedDelta }]
+    }
+    if (parsed.usage) this.upstreamUsageEmitted = true
+
+    // Do NOT call finishAsOpenAISSE on finish_reason: OpenAI streams may
+    // emit a trailing usage chunk between finish_reason and [DONE]. Wait
+    // for upstream [DONE] (or stream-close in the consumer).
+    return [`data: ${JSON.stringify(reEmitted)}\n\n`]
+  }
+
+  finishAsOpenAISSE(): string[] {
+    if (this.finished) return []
+    this.finished = true
+    const out: string[] = []
+
+    if (!this.finalFinishReason) {
+      out.push(
+        `data: ${JSON.stringify({
+          id: this.upstreamId || `chatcmpl-${crypto.randomUUID()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.requestModel,
+          choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+        })}\n\n`,
+      )
+    }
+
+    if (!this.upstreamUsageEmitted && (this.inputTokens > 0 || this.outputTokens > 0)) {
+      out.push(
+        `data: ${JSON.stringify({
+          id: this.upstreamId || `chatcmpl-${crypto.randomUUID()}`,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model: this.requestModel,
+          choices: [],
+          usage: {
+            prompt_tokens: this.inputTokens,
+            completion_tokens: this.outputTokens,
+            total_tokens: this.inputTokens + this.outputTokens,
+          },
+        })}\n\n`,
+      )
+    }
+
+    out.push("data: [DONE]\n\n")
+    return out
+  }
 }
 
 // ─── Stream consumption helper ──────────────────────────────────────────────
@@ -679,15 +781,9 @@ async function handleOpenAIChat(
 
   log(`openai ${isStreaming ? "stream" : "non-stream"} model=${body.model}`)
 
-  // For streaming OpenAI clients we just forward — LiteLLM already emits
-  // reasoning_content correctly there. Cheap path, no transformation overhead.
-  if (isStreaming) {
-    return proxyRequestWithBody(req, url, upstream, "/v1/chat/completions", body)
-  }
-
-  // Non-streaming: drive an internal stream so we can recover reasoning_content
-  // and surface it on the response message. Without this the upstream silently
-  // strips the reasoning trace.
+  // Always stream upstream so we can recover reasoning_content and finalize
+  // cleanly even when LiteLLM's non-stream aggregator strips it (1.83.14 bug
+  // with chatgpt-subs and other providers that bridge /responses → /chat).
   const apiKey =
     req.headers.get("authorization")?.replace(/^Bearer\s+/i, "") ||
     req.headers.get("x-api-key") ||
@@ -709,41 +805,48 @@ async function handleOpenAIChat(
   }
 
   const converter = new OpenAIToAnthropicStream((body.model as string) || "unknown")
+
+  if (isStreaming) {
+    const { readable, writable } = new TransformStream()
+    const encoder = new TextEncoder()
+    ;(async () => {
+      const writer = writable.getWriter()
+      try {
+        await consumeStream(upstreamResp, async (line) => {
+          for (const evt of converter.ingestAsOpenAISSE(line)) {
+            await writer.write(encoder.encode(evt))
+          }
+        })
+        for (const evt of converter.finishAsOpenAISSE()) {
+          await writer.write(encoder.encode(evt))
+        }
+      } catch (err) {
+        log("stream error:", err)
+      } finally {
+        try {
+          await writer.close()
+        } catch {
+          // already closed
+        }
+      }
+    })()
+
+    return new Response(readable, {
+      headers: {
+        "content-type": "text/event-stream",
+        "cache-control": "no-cache",
+        connection: "keep-alive",
+      },
+    })
+  }
+
+  // Non-streaming: drain stream, build single OpenAI completion.
   await consumeStream(upstreamResp, (line) => converter.ingest(line))
   converter.finish()
 
   return new Response(JSON.stringify(converter.buildOpenAICompletion()), {
     status: 200,
     headers: { "content-type": "application/json" },
-  })
-}
-
-async function proxyRequestWithBody(
-  req: Request,
-  url: URL,
-  upstream: string,
-  pathname: string,
-  body: Record<string, unknown>,
-): Promise<Response> {
-  const upstreamUrl = buildUpstreamUrl(upstream, pathname, url.searchParams)
-  const headers: Record<string, string> = {}
-  for (const [key, value] of req.headers.entries()) {
-    const lower = key.toLowerCase()
-    if (lower === "host" || lower === "content-length") continue
-    headers[key] = value
-  }
-  headers["content-type"] = "application/json"
-
-  const upstreamResp = await fetch(upstreamUrl, {
-    ...fetchOpts,
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-  })
-
-  return new Response(upstreamResp.body, {
-    status: upstreamResp.status,
-    headers: upstreamResp.headers,
   })
 }
 
