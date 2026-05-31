@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.1](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.6.0...v1.6.1) (2026-05-31)
+
+
+### Bug Fixes
+
+* fold system prompt into first user message for qwen and agentic-thinking models ([8091bbf](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/8091bbf3e91814776d8c3863468d029894f784fb))
+
 ## [1.6.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.5.0...v1.6.0) (2026-05-11)
 
 
