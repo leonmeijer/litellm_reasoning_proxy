@@ -89,11 +89,13 @@ interface AnthropicMessage {
   content: string | Array<{ type: string; text?: string; [k: string]: unknown }>
 }
 
-// Models whose LiteLLM backend rejects role:"system" messages (e.g.
-// chatgpt-sub via /responses for openai/gpt-5-*: "System messages are not
-// allowed"). For these we fold the system prompt into the first user
-// message so agentic clients like Claude Code work.
-const NO_SYSTEM_ROLE = /^openai\/gpt-5-/
+// Models whose LiteLLM backend rejects role:"system" messages or require the
+// system message to be first (e.g. chatgpt-sub via /responses for
+// openai/gpt-5-*: "System messages are not allowed"; Qwen 3.6 vLLM chat
+// template: "System message must be at the beginning"). For these we fold the
+// system prompt into the first user message so agentic clients like Claude
+// Code work — no system role ever reaches the backend.
+const NO_SYSTEM_ROLE = /^openai\/gpt-5-|^indentia\/qwen|agentic-thinking/
 
 function extractSystemText(value: unknown): string | undefined {
   if (typeof value === "string") return value || undefined
