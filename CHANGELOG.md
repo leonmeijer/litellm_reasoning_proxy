@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.6.2](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.6.1...v1.6.2) (2026-05-31)
+
+
+### Bug Fixes
+
+* fold inline system messages and cover agentic-fast for qwen backend ([986d5c2](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/986d5c243c6ab8cdd43848c7805f4665b991ec93))
+
 ## [1.6.1](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.6.0...v1.6.1) (2026-05-31)
 
 
