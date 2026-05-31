@@ -95,7 +95,7 @@ interface AnthropicMessage {
 // template: "System message must be at the beginning"). For these we fold the
 // system prompt into the first user message so agentic clients like Claude
 // Code work — no system role ever reaches the backend.
-const NO_SYSTEM_ROLE = /^openai\/gpt-5-|^indentia\/qwen|agentic-thinking/
+const NO_SYSTEM_ROLE = /^openai\/gpt-5-|^indentia\/qwen|agentic-/
 
 function extractSystemText(value: unknown): string | undefined {
   if (typeof value === "string") return value || undefined
@@ -155,6 +155,17 @@ function anthropicToOpenAI(
   }
 
   for (const msg of messages) {
+    // Inline system messages (Claude Code's <system-reminder> / api_system).
+    // Qwen's template rejects any non-leading system role, so fold these in too.
+    if (stripsSystem && msg.role === "system") {
+      const t =
+        typeof msg.content === "string"
+          ? msg.content
+          : extractText(msg.content as Array<Record<string, unknown>>)
+      if (t) pendingSystem = pendingSystem ? `${pendingSystem}\n\n${t}` : t
+      continue
+    }
+
     // Assistant: may carry tool_use blocks → emit OpenAI tool_calls
     if (msg.role === "assistant" && Array.isArray(msg.content)) {
       const blocks = msg.content as Array<Record<string, unknown>>
@@ -220,7 +231,20 @@ function anthropicToOpenAI(
   }
 
   if (pendingSystem) {
-    openaiMessages.unshift({ role: "user", content: pendingSystem })
+    // Attach to the last user message rather than prepending a fresh one —
+    // avoids two consecutive user turns (some chat templates require alternation).
+    let li = -1
+    for (let i = openaiMessages.length - 1; i >= 0; i--) {
+      if (openaiMessages[i].role === "user") {
+        li = i
+        break
+      }
+    }
+    if (li >= 0) {
+      openaiMessages[li].content = `${openaiMessages[li].content}\n\n${pendingSystem}`
+    } else {
+      openaiMessages.unshift({ role: "user", content: pendingSystem })
+    }
   }
 
   const openaiBody: Record<string, unknown> = {
