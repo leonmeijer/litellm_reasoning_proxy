@@ -22,6 +22,26 @@ const PORT = parseInt(process.env.PORT || "8081", 10)
 const LOG_DEBUG = process.env.DEBUG === "1"
 const TLS_REJECT = process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0"
 
+// Identity/attribution metadata injected into the forwarded LiteLLM request's
+// `metadata` field so litellm-pulsar-callback can attribute each model call
+// (tenant / quest / agent-class / skill / end-user) → agent_obs.model_calls.
+// One reasoning-proxy sidecar serves one pod = one quest, so these are read
+// once from the pod env. Fully behaviour-neutral when none are set.
+const REQUEST_METADATA: Record<string, string> = (() => {
+  const m: Record<string, string> = {}
+  const put = (key: string, val: string | undefined) => {
+    if (val && val.trim()) m[key] = val.trim()
+  }
+  put("tenant_id", process.env.INDENTIA_TENANT)
+  put("quest_id", process.env.INDENTIA_QUEST_ID)
+  put("agent_class", process.env.INDENTIA_AGENT_CLASS)
+  put("skill_id", process.env.INDENTIA_SKILL_ID)
+  put("pod_id", process.env.POD_NAME ?? process.env.HOSTNAME)
+  put("enduser_id", process.env.ENDUSER_ID)
+  put("enduser_role", process.env.ENDUSER_ROLE)
+  return m
+})()
+
 function log(...args: unknown[]) {
   if (LOG_DEBUG) console.log("[reasoning-proxy]", ...args)
 }
@@ -257,6 +277,9 @@ function anthropicToOpenAI(
   if (body.temperature !== undefined) openaiBody.temperature = body.temperature
   if (body.top_p !== undefined) openaiBody.top_p = body.top_p
   if (body.stop_sequences) openaiBody.stop = body.stop_sequences
+  // Carry attribution metadata through the Anthropic→OpenAI transform so the
+  // streaming path reaches litellm-pulsar-callback with the same tags.
+  if (body.metadata) openaiBody.metadata = body.metadata
 
   // Tools schema: Anthropic → OpenAI function-calling.
   if (Array.isArray(body.tools)) {
@@ -1000,6 +1023,14 @@ async function handleAnthropicMessages(
   upstream: string,
 ): Promise<Response> {
   const body = (await req.json()) as Record<string, unknown>
+
+  // Attribution: env-derived identity wins over any client-supplied metadata,
+  // so the call is correctly tagged regardless of the agent harness. Applies to
+  // both the streaming (→ anthropicToOpenAI) and non-streaming passthrough path.
+  if (Object.keys(REQUEST_METADATA).length > 0) {
+    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA }
+  }
+
   const isStreaming = body.stream === true
 
   const apiKey =
@@ -1074,6 +1105,13 @@ async function handleOpenAIChat(
   upstream: string,
 ): Promise<Response> {
   const body = (await req.json()) as Record<string, unknown>
+
+  // Attribution: same env-derived metadata as the Anthropic path, so OpenAI
+  // /v1/chat/completions calls are tagged for litellm-pulsar-callback too.
+  if (Object.keys(REQUEST_METADATA).length > 0) {
+    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA }
+  }
+
   const isStreaming = body.stream === true
 
   log(`openai ${isStreaming ? "stream" : "non-stream"} model=${body.model}`)
