@@ -22,25 +22,91 @@ const PORT = parseInt(process.env.PORT || "8081", 10)
 const LOG_DEBUG = process.env.DEBUG === "1"
 const TLS_REJECT = process.env.NODE_TLS_REJECT_UNAUTHORIZED !== "0"
 
-// Identity/attribution metadata injected into the forwarded LiteLLM request's
-// `metadata` field so litellm-pulsar-callback can attribute each model call
-// (tenant / quest / agent-class / skill / end-user) → agent_obs.model_calls.
-// One reasoning-proxy sidecar serves one pod = one quest, so these are read
-// once from the pod env. Fully behaviour-neutral when none are set.
-const REQUEST_METADATA: Record<string, string> = (() => {
+// Two distinct, additive metadata layers ride on every forwarded LiteLLM
+// request, both derived once from the pod env (one reasoning-proxy sidecar
+// serves one pod = one quest). Both are fully behaviour-neutral when unset.
+//
+//   1. REQUEST_METADATA — FLAT keys consumed by litellm-pulsar-callback, which
+//      publishes a ModelCallEvent → ClickHouse agent_obs.model_calls for cost
+//      lineage (ADR-151). These key names are a contract; never rename/drop them.
+//
+//   2. LANGFUSE_TRACE_META — the *specific* keys LiteLLM's `langfuse`
+//      success_callback recognises and lifts onto the Langfuse trace
+//      (trace_user_id → userId, session_id → sessionId, tags[] → tags,
+//      trace_name → name). The flat keys above are invisible to the langfuse
+//      logger, so without these the human-facing Langfuse traces (ADR-075) have
+//      no user, no session grouping and no tags. Derived from the SAME env — no
+//      new env vars or deploy config required.
+//
+// Both builders are exported as pure functions (env in → object out) so the
+// mapping can be unit-tested without booting the proxy.
+
+/** Flat attribution metadata for litellm-pulsar-callback (ADR-151). Pure. */
+export function buildRequestMetadata(env: Record<string, string | undefined>): Record<string, string> {
   const m: Record<string, string> = {}
   const put = (key: string, val: string | undefined) => {
     if (val && val.trim()) m[key] = val.trim()
   }
-  put("tenant_id", process.env.INDENTIA_TENANT)
-  put("quest_id", process.env.INDENTIA_QUEST_ID)
-  put("agent_class", process.env.INDENTIA_AGENT_CLASS)
-  put("skill_id", process.env.INDENTIA_SKILL_ID)
-  put("pod_id", process.env.POD_NAME ?? process.env.HOSTNAME)
-  put("enduser_id", process.env.ENDUSER_ID)
-  put("enduser_role", process.env.ENDUSER_ROLE)
+  put("tenant_id", env.INDENTIA_TENANT)
+  put("quest_id", env.INDENTIA_QUEST_ID)
+  put("agent_class", env.INDENTIA_AGENT_CLASS)
+  put("skill_id", env.INDENTIA_SKILL_ID)
+  put("pod_id", env.POD_NAME ?? env.HOSTNAME)
+  put("enduser_id", env.ENDUSER_ID)
+  put("enduser_role", env.ENDUSER_ROLE)
   return m
+}
+
+/**
+ * Langfuse-recognised trace keys (ADR-075). Distinct from the flat keys: these
+ * are the only metadata keys LiteLLM's langfuse logger maps onto the trace.
+ * `tags` is an array, hence Record<string, unknown> (not Record<string,string>).
+ * Pure; emits a key only when its source value is present.
+ */
+export function buildLangfuseTraceMeta(env: Record<string, string | undefined>): Record<string, unknown> {
+  const meta: Record<string, unknown> = {}
+  const clean = (val: string | undefined): string | undefined => {
+    const t = val?.trim()
+    return t ? t : undefined
+  }
+  const tenant = clean(env.INDENTIA_TENANT)
+  const quest = clean(env.INDENTIA_QUEST_ID)
+  const agentClass = clean(env.INDENTIA_AGENT_CLASS)
+  const skill = clean(env.INDENTIA_SKILL_ID)
+  const enduser = clean(env.ENDUSER_ID)
+
+  // session_id collapses every LLM call of one quest into one Langfuse session.
+  if (quest) meta.session_id = quest
+  // trace_user_id: end-user when known, else the tenant (ADR-075 user_id).
+  const traceUser = enduser ?? tenant
+  if (traceUser) meta.trace_user_id = traceUser
+  // tags: only the present values, as "key:value" strings.
+  const tags: string[] = []
+  if (tenant) tags.push(`tenant:${tenant}`)
+  if (agentClass) tags.push(`agent_class:${agentClass}`)
+  if (skill) tags.push(`skill_id:${skill}`)
+  if (tags.length > 0) meta.tags = tags
+  // trace_name: human-friendly label, skill preferred over agent class.
+  const traceName = skill ?? agentClass
+  if (traceName) meta.trace_name = traceName
+  return meta
+}
+
+const REQUEST_METADATA: Record<string, string> = buildRequestMetadata(process.env)
+
+// Built defensively: a malformed env value must never break the proxied request.
+const LANGFUSE_TRACE_META: Record<string, unknown> = (() => {
+  try {
+    return buildLangfuseTraceMeta(process.env)
+  } catch (err) {
+    log("failed to build Langfuse trace metadata; continuing without it", err)
+    return {}
+  }
 })()
+
+// True when either layer has at least one key to inject (cheap, computed once).
+const HAS_INJECTED_METADATA =
+  Object.keys(REQUEST_METADATA).length > 0 || Object.keys(LANGFUSE_TRACE_META).length > 0
 
 function log(...args: unknown[]) {
   if (LOG_DEBUG) console.log("[reasoning-proxy]", ...args)
@@ -958,37 +1024,43 @@ async function callUpstreamStream(
 
 // ─── HTTP server ─────────────────────────────────────────────────────────────
 
-const server = Bun.serve({
-  port: PORT,
-  idleTimeout: 255,
-  async fetch(req) {
-    const url = new URL(req.url)
-    let upstream: string
+// Only bind the port when run as the entry point. Importing this module (e.g.
+// from server.test.ts to exercise the metadata builders) must NOT start a
+// listener — guard the bootstrap behind import.meta.main.
+if (import.meta.main) {
+  Bun.serve({
+    port: PORT,
+    idleTimeout: 255,
+    async fetch(req) {
+      const url = new URL(req.url)
+      let upstream: string
 
-    try {
-      upstream = resolveUpstream(url)
-    } catch (error) {
-      return badRequest(error instanceof Error ? error.message : "invalid target URL")
-    }
-
-    if (url.pathname === "/health") {
-      return new Response(JSON.stringify({ status: "ok", upstream }), {
-        headers: { "content-type": "application/json" },
-      })
-    }
-
-    if (req.method === "POST") {
-      if (url.pathname === "/v1/messages" || url.pathname === "/v1/messages/") {
-        return handleAnthropicMessages(req, url, upstream)
+      try {
+        upstream = resolveUpstream(url)
+      } catch (error) {
+        return badRequest(error instanceof Error ? error.message : "invalid target URL")
       }
-      if (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/chat/completions/") {
-        return handleOpenAIChat(req, url, upstream)
-      }
-    }
 
-    return proxyRequest(req, url, upstream)
-  },
-})
+      if (url.pathname === "/health") {
+        return new Response(JSON.stringify({ status: "ok", upstream }), {
+          headers: { "content-type": "application/json" },
+        })
+      }
+
+      if (req.method === "POST") {
+        if (url.pathname === "/v1/messages" || url.pathname === "/v1/messages/") {
+          return handleAnthropicMessages(req, url, upstream)
+        }
+        if (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/chat/completions/") {
+          return handleOpenAIChat(req, url, upstream)
+        }
+      }
+
+      return proxyRequest(req, url, upstream)
+    },
+  })
+  console.log(`Reasoning proxy listening on :${PORT} → ${UPSTREAM}`)
+}
 
 async function proxyRequest(req: Request, url: URL, upstream: string): Promise<Response> {
   const upstreamUrl = buildUpstreamUrl(upstream, url.pathname, url.searchParams)
@@ -1025,10 +1097,13 @@ async function handleAnthropicMessages(
   const body = (await req.json()) as Record<string, unknown>
 
   // Attribution: env-derived identity wins over any client-supplied metadata,
-  // so the call is correctly tagged regardless of the agent harness. Applies to
-  // both the streaming (→ anthropicToOpenAI) and non-streaming passthrough path.
-  if (Object.keys(REQUEST_METADATA).length > 0) {
-    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA }
+  // so the call is correctly tagged regardless of the agent harness. Carries
+  // both the flat keys (litellm-pulsar-callback, ADR-151) and the Langfuse
+  // trace keys (ADR-075). Applies to both the streaming (→ anthropicToOpenAI,
+  // which propagates body.metadata to openaiBody.metadata) and the
+  // non-streaming passthrough path.
+  if (HAS_INJECTED_METADATA) {
+    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA, ...LANGFUSE_TRACE_META }
   }
 
   const isStreaming = body.stream === true
@@ -1106,10 +1181,11 @@ async function handleOpenAIChat(
 ): Promise<Response> {
   const body = (await req.json()) as Record<string, unknown>
 
-  // Attribution: same env-derived metadata as the Anthropic path, so OpenAI
-  // /v1/chat/completions calls are tagged for litellm-pulsar-callback too.
-  if (Object.keys(REQUEST_METADATA).length > 0) {
-    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA }
+  // Attribution: same env-derived metadata as the Anthropic path (flat keys for
+  // litellm-pulsar-callback ADR-151 + Langfuse trace keys ADR-075), so OpenAI
+  // /v1/chat/completions calls are tagged and grouped identically.
+  if (HAS_INJECTED_METADATA) {
+    body.metadata = { ...(body.metadata ?? {}), ...REQUEST_METADATA, ...LANGFUSE_TRACE_META }
   }
 
   const isStreaming = body.stream === true
@@ -1184,5 +1260,3 @@ async function handleOpenAIChat(
     headers: { "content-type": "application/json" },
   })
 }
-
-console.log(`Reasoning proxy listening on :${PORT} → ${UPSTREAM}`)
