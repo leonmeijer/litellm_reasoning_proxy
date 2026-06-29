@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.0](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.6.2...v1.7.0) (2026-06-29)
+
+
+### Features
+
+* enrich Langfuse traces with user, session & tags (ADR-075) ([#10](https://github.com/leonmeijer/litellm_reasoning_proxy/issues/10)) ([52643dc](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/52643dce3625038f776a9e908b1b8348bb499f8b))
+* inject attribution metadata into forwarded LiteLLM requests ([#7](https://github.com/leonmeijer/litellm_reasoning_proxy/issues/7)) ([a604127](https://github.com/leonmeijer/litellm_reasoning_proxy/commit/a60412714246faf81e3cca6a38a64c114fbccf77))
+
 ## [1.6.2](https://github.com/leonmeijer/litellm_reasoning_proxy/compare/v1.6.1...v1.6.2) (2026-05-31)
 
 
